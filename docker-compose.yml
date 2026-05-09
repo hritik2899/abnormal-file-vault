@@ -3,7 +3,7 @@ version: '3.8'
 services:
   web:
     build: .
-    command: python manage.py runserver 0.0.0.0:8000
+    command: sh -c "python manage.py makemigrations core && python manage.py migrate && python manage.py runserver 0.0.0.0:8000"
     volumes:
       - .:/app
       # Local volume to store physical uploaded files
@@ -36,6 +36,22 @@ services:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+
+  celery:
+    build: .
+    command: celery -A vault_backend worker --loglevel=info
+    volumes:
+      - .:/app
+      - vault_data:/app/vault_data
+    depends_on:
+      - db
+      - redis
+    environment:
+      - POSTGRES_DB=vault_db
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_HOST=db
+      - REDIS_URL=redis://redis:6379/1
 
 volumes:
   postgres_data:
