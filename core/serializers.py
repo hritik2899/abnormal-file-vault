@@ -1,15 +1,21 @@
+
 from rest_framework import serializers
-from .models import User, PhysicalBlob, FileMetadata
+from .models import File
 
-class UserSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = User
-        fields = ['id', 'username', 'email', 'storage_quota_bytes']
-
-class FileMetadataSerializer(serializers.ModelSerializer):
-    size_bytes = serializers.IntegerField(source='blob.size_bytes', read_only=True)
-    file_hash = serializers.CharField(source='blob.file_hash', read_only=True)
+class FileSerializer(serializers.ModelSerializer):
+    file = serializers.SerializerMethodField()
 
     class Meta:
-        model = FileMetadata
-        fields = ['id', 'original_filename', 'extension', 'uploaded_at', 'tags', 'size_bytes', 'file_hash']
+        model = File
+        fields = [
+            'id', 'file', 'original_filename', 'file_type', 
+            'size', 'uploaded_at', 'user_id', 'file_hash', 
+            'reference_count', 'is_reference', 'original_file'
+        ]
+        
+    def get_file(self, obj):
+        if obj.is_reference and obj.original_file and obj.original_file.file:
+            return obj.original_file.file.url
+        elif obj.file:
+            return obj.file.url
+        return None

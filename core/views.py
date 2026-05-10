@@ -1,70 +1,108 @@
-import os
-import uuid
+
+import hashlib
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
 from django.conf import settings
-from .models import FileMetadata, PhysicalBlob
-from .serializers import FileMetadataSerializer
-from .tasks import stitch_and_process_upload
+from .models import File
+from .serializers import FileSerializer
+from .throttles import UserIdRateThrottle
+import django_filters
+from django_filters import rest_framework as filters
+
+class FileFilter(filters.FilterSet):
+    search = filters.CharFilter(field_name='original_filename', lookup_expr='icontains')
+    min_size = filters.NumberFilter(field_name='size', lookup_expr='gte')
+    max_size = filters.NumberFilter(field_name='size', lookup_expr='lte')
+    start_date = filters.DateTimeFilter(field_name='uploaded_at', lookup_expr='gte')
+    end_date = filters.DateTimeFilter(field_name='uploaded_at', lookup_expr='lte')
+
+    class Meta:
+        model = File
+        fields = ['file_type']
 
 class FileViewSet(viewsets.ModelViewSet):
-    serializer_class = FileMetadataSerializer
-    permission_classes = [IsAuthenticated]
+    queryset = File.objects.all()
+    serializer_class = FileSerializer
+    throttle_classes = [UserIdRateThrottle]
+    filterset_class = FileFilter
 
     def get_queryset(self):
-        return FileMetadata.objects.filter(user=self.request.user)
+        if hasattr(self.request, 'user') and hasattr(self.request.user, 'user_id'):
+            return File.objects.filter(user_id=self.request.user.user_id)
+        return File.objects.none()
 
-    @action(detail=False, methods=['post'])
-    def init_upload(self, request):
-        file_hash = request.data.get('file_hash')
-        total_size = int(request.data.get('total_size', 0))
-        filename = request.data.get('filename')
+    def create(self, request, *args, **kwargs):
+        user_id = request.user.user_id
+        uploaded_file = request.FILES.get('file')
         
-        if not file_hash or not filename or total_size <= 0:
-            return Response({"error": "Missing fields"}, status=status.HTTP_400_BAD_REQUEST)
+        if not uploaded_file:
+            return Response({"error": "No file provided"}, status=status.HTTP_400_BAD_REQUEST)
 
-        if request.user.current_storage_usage() + total_size > request.user.storage_quota_bytes:
-            return Response({"error": "Quota exceeded"}, status=status.HTTP_403_FORBIDDEN)
+        size = uploaded_file.size
+        
+        actual_storage_used = sum(f.size for f in File.objects.filter(user_id=user_id, is_reference=False))
+        
+        sha256 = hashlib.sha256()
+        for chunk in uploaded_file.chunks():
+            sha256.update(chunk)
+        file_hash = sha256.hexdigest()
 
-        existing_blob = PhysicalBlob.objects.filter(file_hash=file_hash).first()
-        if existing_blob:
-            _, ext = os.path.splitext(filename)
-            metadata = FileMetadata.objects.create(
-                user=request.user, blob=existing_blob, original_filename=filename, extension=ext
+        existing_file = File.objects.filter(file_hash=file_hash, is_reference=False).first()
+        
+        if not existing_file:
+            if actual_storage_used + size > settings.STORAGE_QUOTA_BYTES:
+                return Response({"detail": "Storage Quota Exceeded"}, status=429)
+
+        original_filename = uploaded_file.name
+        file_type = uploaded_file.content_type
+
+        if existing_file:
+            file_instance = File.objects.create(
+                original_filename=original_filename,
+                file_type=file_type,
+                size=size,
+                user_id=user_id,
+                file_hash=file_hash,
+                is_reference=True,
+                original_file=existing_file
             )
-            return Response({"status": "deduplicated", "id": metadata.id}, status=status.HTTP_201_CREATED)
+        else:
+            uploaded_file.seek(0)
+            file_instance = File.objects.create(
+                file=uploaded_file,
+                original_filename=original_filename,
+                file_type=file_type,
+                size=size,
+                user_id=user_id,
+                file_hash=file_hash,
+                is_reference=False
+            )
 
-        upload_id = str(uuid.uuid4())
-        return Response({"upload_id": upload_id, "status": "ready"}, status=status.HTTP_200_OK)
+        serializer = self.get_serializer(file_instance)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
 
-    @action(detail=False, methods=['post'])
-    def upload_chunk(self, request):
-        upload_id = request.data.get('upload_id')
-        chunk_number = request.data.get('chunk_number')
-        chunk_file = request.FILES.get('file')
-
-        if not all([upload_id, chunk_number, chunk_file]):
-            return Response({"error": "Missing data"}, status=status.HTTP_400_BAD_REQUEST)
-
-        temp_dir = os.path.join(settings.MEDIA_ROOT, 'temp_uploads', upload_id)
-        os.makedirs(temp_dir, exist_ok=True)
+    @action(detail=False, methods=['get'])
+    def storage_stats(self, request):
+        user_id = request.user.user_id
+        files = File.objects.filter(user_id=user_id)
         
-        with open(os.path.join(temp_dir, f"{int(chunk_number):05d}.chunk"), 'wb+') as dest:
-            for c in chunk_file.chunks():
-                dest.write(c)
+        original_storage_used = sum(f.size for f in files)
+        total_storage_used = sum(f.size for f in files if not f.is_reference)
+        
+        storage_savings = original_storage_used - total_storage_used
+        savings_percentage = (storage_savings / original_storage_used * 100) if original_storage_used > 0 else 0.0
 
-        return Response({"status": "chunk received"}, status=status.HTTP_200_OK)
+        return Response({
+            "user_id": user_id,
+            "total_storage_used": total_storage_used,
+            "original_storage_used": original_storage_used,
+            "storage_savings": storage_savings,
+            "savings_percentage": savings_percentage
+        })
 
-    @action(detail=False, methods=['post'])
-    def complete_upload(self, request):
-        upload_id = request.data.get('upload_id')
-        file_hash = request.data.get('file_hash')
-        filename = request.data.get('filename')
-
-        if not all([upload_id, file_hash, filename]):
-            return Response({"error": "Missing data"}, status=status.HTTP_400_BAD_REQUEST)
-
-        stitch_and_process_upload.delay(request.user.id, upload_id, file_hash, filename)
-        return Response({"status": "processing"}, status=status.HTTP_202_ACCEPTED)
+    @action(detail=False, methods=['get'])
+    def file_types(self, request):
+        user_id = request.user.user_id
+        file_types = File.objects.filter(user_id=user_id).values_list('file_type', flat=True).distinct()
+        return Response(list(file_types))
